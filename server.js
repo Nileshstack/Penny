@@ -1,52 +1,93 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const morgan = require('morgan');
-const dotenv = require('dotenv');
+const mongoose = require('mongoose');
 const connectDB = require('./config/db');
-const path = require('path');
-
-dotenv.config();
-connectDB();
+const errorHandler = require('./middleware/errorHandler');
+const ApiError = require('./middleware/ApiError');
 
 const app = express();
+let server;
+let startupPromise;
 
-const allowedOrigins = [
-  'https://pennypilot-jlfq.onrender.com',  // ✅ New frontend
-  'http://localhost:3000'
-];
+const allowedOrigins = new Set(
+  (process.env.CLIENT_ORIGINS || (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:3000'))
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
 
-// ✅ CORS middleware
-const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+app.disable('x-powered-by');
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
+app.use(helmet());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) {
+      return callback(null, true);
     }
+    return callback(new ApiError(403, 'Origin is not allowed by CORS'));
   },
-  credentials: true,
-};
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-app.use(cors(corsOptions));
+app.get('/api/health', (req, res) => {
+  const databaseConnected = mongoose.connection.readyState === 1;
+  res.status(databaseConnected ? 200 : 503).json({
+    status: databaseConnected ? 'ok' : 'unavailable',
+    database: databaseConnected ? 'connected' : 'disconnected',
+  });
+});
 
-// ✅ Handle preflight requests
-app.options('*', cors(corsOptions));
-
-// Middlewares
-app.use(morgan('dev'));
-app.use(express.json());
-
-// API Routes
 app.use('/api/v1/users', require('./routes/userRoutes'));
 app.use('/api/v1/transections', require('./routes/transectionRoutes'));
 
-// Serve React frontend
-app.use(express.static(path.join(__dirname, './client/build')));
-app.get('*', function (req, res) {
-  res.sendFile(path.join(__dirname, './client/build/index.html'));
+app.use((req, res, next) => {
+  next(new ApiError(404, 'Route not found'));
 });
+app.use(errorHandler);
 
-// Start server
-app.listen(process.env.PORT || 8080, () => {
-  console.log(`Node server is running in ${process.env.DEV_MODE} mode on port ${process.env.PORT}`);
-});
+function validateEnvironment() {
+  if (!process.env.MONGO_URL) {
+    throw new Error('MONGO_URL is required');
+  }
+  if (!process.env.JWT_KEY) {
+    throw new Error('JWT_KEY is required');
+  }
+  if (process.env.NODE_ENV === 'production' && process.env.JWT_KEY.length < 32) {
+    throw new Error('JWT_KEY must contain at least 32 characters in production');
+  }
+}
+
+async function startServer() {
+  if (server) {
+    return server;
+  }
+  if (!startupPromise) {
+    startupPromise = (async () => {
+      validateEnvironment();
+      await connectDB();
+      const port = Number(process.env.PORT) || 8080;
+      server = app.listen(port, '0.0.0.0', () => {
+        console.log(`PennyPilot API listening on port ${port}`);
+      });
+      return server;
+    })();
+  }
+  return startupPromise;
+}
+
+if (require.main === module) {
+  startServer().catch(() => {
+    console.error('Server startup failed. Check MONGO_URL, JWT_KEY, and database availability.');
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { app, startServer, validateEnvironment };
